@@ -214,11 +214,19 @@ TEST(MatMulNBitsWorkspace, TacticProfilerMCapStaysWithinScratchLimit) {
 
 TEST(MatMulNBitsWorkspace, InitialProfileBucketsMatchOverrideAndDefaultRules) {
   EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMBuckets(
-                /*min_m=*/1, /*max_m=*/256, {}),
+                /*min_m=*/1, /*max_m=*/256, {}, /*gemv_enabled=*/false),
             (std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256}));
   EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMBuckets(
                 /*min_m=*/1, /*max_m=*/256, {8, 64}),
             (std::vector<int>{1, 8, 64, 256}));
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMBuckets(
+                /*min_m=*/1, /*max_m=*/16, {}, /*gemv_enabled=*/true),
+            (std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}));
+  for (int rows : {8, 9, 15, 16}) {
+    EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(rows, true), rows);
+  }
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(9, false), 16);
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(17, true), 32);
 }
 
 TEST(MatMulNBitsWorkspace, TacticProfilerTimedRunsPruneOnlyExpensiveSlowTactics) {

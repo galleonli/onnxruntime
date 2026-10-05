@@ -692,7 +692,7 @@ void MatMulNBits<T>::InitGemmProfiler(int sm) {
   }
 #endif
 
-  gemmProfiler_->setCudaKernelType(cuda_kernel_type, sm);
+  gemmProfiler_->setCudaKernelType(cuda_kernel_type, sm, has_fpA_intB_gemv_);
   gemmProfiler_->setL2CacheBytes(static_cast<size_t>(this->GetDeviceProp().l2CacheSize));
   gemmProfiler_->setQuant(static_cast<int>(nbits_), has_bias_, has_zero_points_);
   gemmProfiler_->setGroupSize(static_cast<int>(block_size_));
@@ -717,14 +717,19 @@ void MatMulNBits<T>::InitGemmProfiler(int sm) {
 
   const auto& device_prop = this->GetDeviceProp();
   gc::HardwareSignature signature = gc::HardwareSignature::FromDevice(
-      device_prop.name, device_prop.major * 10 + device_prop.minor, device_prop.multiProcessorCount);
+      device_prop.name, device_prop.major * 10 + device_prop.minor, device_prop.multiProcessorCount,
+      device_prop.l2CacheSize);
   std::string file_path = gc::MatMulNBitsTacticCache::ResolveFilePath(
       info.GetConfigOptions().GetConfigOrDefault(gc::kSessionConfigCacheDir, ""),
       info.GetConfigOptions().GetConfigOrDefault(gc::kSessionConfigCachePrefix, ""), signature, sidecar_prefix);
+  std::shared_ptr<gc::MatMulNBitsTacticCache> cache;
   if (!file_path.empty()) {
-    gemmProfiler_->setPersistentCache(
-        GetGlobalMatMulNBitsTacticCache(std::move(file_path), std::move(signature), access->load), *access);
+    cache = GetGlobalMatMulNBitsTacticCache(std::move(file_path), std::move(signature), access->load);
   }
+  auto session_map = access->RequiresIsolatedProfiles(cache != nullptr)
+                         ? s_profilerManager.getSessionProfileMap(info.GetExecutionProvider())
+                         : nullptr;
+  gemmProfiler_->setPersistentCache(std::move(cache), *access, std::move(session_map));
 
   auto allocator = this->Info().GetAllocator(OrtMemType::OrtMemTypeDefault);
   gemmProfiler_->setAllocator(allocator);
@@ -742,6 +747,11 @@ void MatMulNBits<T>::RunGemmProfile(bool hasWeightOnlyCudaKernel, int min_m, int
                                                  : onnxruntime::llm::nvinfer::DataType::kHALF;
   gemmId_ = GemmIdCore(n_16b, static_cast<int>(K_), dtype, kernel_sm, static_cast<int>(nbits_),
                        static_cast<int>(block_size_), has_zero_points_, hasWeightOnlyCudaKernel);
+  gemmId_.has_bias = has_bias_;
+  const auto& device_uuid = this->GetDeviceProp().uuid.bytes;
+  std::copy(std::begin(device_uuid), std::end(device_uuid), gemmId_.device_uuid.begin());
+  gemmId_.candidate_fingerprint = onnxruntime::llm::gemm_cache::CandidateSetFingerprint(
+      weightOnlyGemmRunner_->getConfigs(), hasWeightOnlyCudaKernel);
 
   GemmDims dims = {min_m, max_m, n_16b, K_};
   gemmProfiler_->profileTactics(weightOnlyGemmRunner_, gemmId_.dtype, dims, gemmId_, hasWeightOnlyCudaKernel);

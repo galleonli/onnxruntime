@@ -1,4 +1,111 @@
-# fpA_intB / QMoE GEMM Tactic Autotune Cache — Design & Plan
+# fpA_intB GEMM Tactic Autotune Cache
+
+## Current Contract: v2
+
+Persistence is implemented for the CUDA `MatMulNBits` fpA_intB path only. It caches
+CUDA-GEMV or CUTLASS tactics within the selected packed-weight runner; it does not choose
+between fpA_intB and the legacy fused/dequantize-plus-cuBLAS backends. MatMul and QMoE
+persistence are future, separate consumers, not tables currently written by this implementation.
+
+The transport remains TSV at `<prefix>.matmulnbits_fpa_intb.tsv`. Persistence is opt-in.
+Matching rows load at kernel construction; newly tuned rows are staged in memory and saved
+at CUDA EP teardown. Locations, modes, sidecars, and offline tooling are described in
+[matmul_nbits.md](matmul_nbits.md#61-fpa_intb-tactic-autotune-cache).
+
+### Envelope and Compatibility
+
+The required header identifies the table and `ort_cuda_gemm_tactic_cache=v2`, with independent
+`kernel_abi_version`, `kernel_implementation_version`, `config_codec_version`, and
+`tactic_selection_version`. All must match. The implementation revision is maintained per
+kernel family: bump it when kernel code changes behind unchanged configurations; bump the
+codec revision when integer enum mappings or configuration semantics change. A new identity
+field requires a format-version change, not silently defaulting it for an old reader.
+
+The strict hardware/build signature includes GPU name, physical SM, multiprocessor count,
+L2 capacity, compiled CUDA toolkit version, ORT version, build configuration, and kernel build
+features. The feature signature records compact/full mode, quick build, BF16 support, excluded
+architectures, CUTLASS version, and host compiler version. Driver and git commit remain provenance.
+Physical GPU UUID isolates in-process selection; disk reuse is portable between matching boards.
+
+Profiling context is explicit and strict:
+
+```text
+runner_family              cutlass_fpa_intb
+timing_mode                synthetic_stream
+cache_conditioning_policy  warm_weights_l2_gemv_bias_v1
+m_bucket_policy            exact_gemv_then_pow2_v1
+```
+
+These names describe the existing synthetic stream measurements and L2 correction. They do
+not imply CUDA graph replay validation. A future replay profiler must produce separately
+identified results and update the selection revision; it cannot relabel existing stream winners.
+
+v1 files are rejected and re-tuned. They are not automatically promoted because their full
+candidate, hardware-capacity, and selection context cannot be established.
+
+### Problem and Result
+
+The problem key is:
+
+```text
+n, k, activation_dtype, weight_type, bits, block_size,
+has_zero_points, has_bias, gemv_enabled, packing_sm, candidate_fingerprint
+```
+
+`n` is logical output width, not the old packed `n_16b`. Packing SM distinguishes the SM80
+layout from native-SM90 layout. Runtime scaled zero points and output dtype are determined
+by the activation/runner contract; source zero-point dtype is deliberately not a separate key.
+The candidate fingerprint is a deterministic, order-independent hash of the normalized current
+runner configurations and eligible CUDA-GEMV family. Added or removed candidates invalidate
+reuse even when the old winner remains executable. Implementation revisions additionally
+detect code changes that leave the candidate list unchanged.
+
+Each `(problem, m_bucket)` row has `result_status=selected`, `kernel_family=cutlass|cuda_gemv`,
+and a `kernel_config_version`, followed by the existing integer configuration fields.
+CUDA-GEMV has a canonical family identity rather than depending on irrelevant CUTLASS tiles.
+Both families are checked against the current candidate set and M eligibility before reuse.
+Negative/transient profiling failures are retained only in the live profile map, not persisted.
+
+All key and configuration fields are read by column name. Reordering columns and inserting
+unknown non-identity metadata is supported; missing required fields and duplicate column
+names are rejected. Free text uses percent escaping for `%`, tab, newline, and carriage return.
+
+### M Policy and Session Isolation
+
+When CUDA-GEMV is eligible, default construction profiling includes every M from 1 through 15,
+then geometric buckets 16, 32, ..., 2048, clamped to the problem range. Otherwise geometric
+buckets are used throughout. Explicit profile lists override the initial sweep. Runtime lookup
+and lazy profiling keep M=1-15 exact when GEMV is eligible, so M=9-15 cannot reuse an M=16
+winner that excluded GEMV. Larger M values round up, capped at 8192. Chunked execution keys
+the actual launch row count, including a partial trailing chunk.
+
+Persistent-cache sessions and `save` mode use session-scoped selection maps. Same-shape nodes
+deduplicate within a session; an existing process-global winner cannot bypass re-tuning in a
+new `save` session or hide refreshed disk rows from a new loading session. Live sessions retain
+their selections. Weak ownership prevents a recycled EP/session address from inheriting a
+closed session's map. Nonpersistent default sessions retain process-wide deduplication keyed
+by device UUID, quantization/bias/packing context, and candidate identity.
+
+### Refresh and Merge
+
+The cache separates a loaded snapshot from dirty row deltas. Reload replaces clean rows,
+preserves local dirty rows, and discards clean rows removed from or invalidated by the file.
+Flush acquires the file lock, reloads the current disk snapshot, overlays only dirty rows,
+and atomically replaces the file. It adopts the merged snapshot without resurrecting old
+clean rows. Updates arriving during flush remain dirty for the next flush.
+
+### Extension Boundary
+
+Future MatMul and QMoE implementations should reuse the envelope, locking, escaping, version
+rules, and family-specific codecs, while retaining separate tables and problem contracts.
+MatMul needs its exact shape, candidate/alignment/constant-B context, and stream/replay policy.
+QMoE additionally needs runner/quantization/scale/layout identity, GEMM1/GEMM2 role, expert
+topology, activation/epilogue, output type, and full parallelism configuration. Neither should
+be forced into the MatMulNBits key or represented as a CUTLASS config when it selects another
+kernel family. Legacy TunableOp export/import is separate from this automatic cache lifecycle.
+
+<details>
+<summary>Original research and roadmap (historical, superseded by the v2 contract above)</summary>
 
 ## 1. Motivation
 
@@ -331,3 +438,5 @@ and must avoid dependencies on non-plugin CUDA EP internals.
   version; driver, MP count, git commit, and build config stay diagnostic unless validation shows
   they must be strict.
 2. **JSON fallback** — switch to hand-rolled JSON only if nested/optional structure is later required.
+
+</details>

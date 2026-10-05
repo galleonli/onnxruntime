@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,10 +43,17 @@ using onnxruntime::llm::cutlass_extensions::CutlassGemmConfig;
 
 // Cache file format version. Bump when the on-disk schema changes incompatibly.
 constexpr const char* kCacheMagic = "ort_cuda_gemm_tactic_cache";
-constexpr const char* kCacheFormatVersion = "v1";
+constexpr const char* kCacheFormatVersion = "v2";
 
 // Bump whenever profiling or tactic selection changes which tactic wins, so stale caches are rejected.
-constexpr const char* kTacticSelectionVersion = "1";
+constexpr const char* kTacticSelectionVersion = "2";
+constexpr const char* kKernelAbiVersion = "1";
+constexpr const char* kKernelImplementationVersion = "1";
+constexpr const char* kConfigCodecVersion = "1";
+constexpr const char* kTimingMode = "synthetic_stream";
+constexpr const char* kCacheConditioningPolicy = "warm_weights_l2_gemv_bias_v1";
+constexpr const char* kMBucketPolicy = "exact_gemv_then_pow2_v1";
+constexpr const char* kRunnerFamily = "cutlass_fpa_intb";
 
 constexpr const char* kTableMatMulNBits = "matmulnbits_fpa_intb";
 
@@ -70,6 +78,10 @@ constexpr const char* kSessionConfigCacheToModel = "ep.cuda.gemm_tactic_cache_to
 struct CacheAccess {
   bool load = true;
   bool save = true;
+
+  bool RequiresIsolatedProfiles(bool persistence_enabled) const {
+    return persistence_enabled || !load;
+  }
 };
 
 // Returns std::nullopt for an unrecognized mode. An empty mode means "load_save".
@@ -82,27 +94,25 @@ std::optional<bool> ParseCacheFlag(const std::string& value);
 // Hardware / build signature used both to name cache files and as a stored guard.
 // Reuse is rejected on mismatch of any strict field (see StrictMatches).
 struct HardwareSignature {
-  std::string device_name;       // cudaDeviceProp.name, e.g. "NVIDIA A100-SXM4-80GB"
-  int sm = 0;                    // major*10 + minor, e.g. 80, 89, 90
-  int multiprocessor_count = 0;  // diagnostic only
-  int cuda_runtime = 0;          // CUDART_VERSION
-  int cuda_driver = 0;           // cudaDriverGetVersion(), diagnostic only
-  std::string ort_version;       // ORT_VERSION (strict-match field)
-  std::string ort_git_commit;    // parsed from ORT_BUILD_INFO or "unknown" (diagnostic only)
-  std::string ort_build_config;  // "Release" / "Debug" (diagnostic only)
+  std::string device_name;  // cudaDeviceProp.name, e.g. "NVIDIA A100-SXM4-80GB"
+  int sm = 0;               // major*10 + minor, e.g. 80, 89, 90
+  int multiprocessor_count = 0;
+  int l2_cache_bytes = 0;
+  int cuda_runtime = 0;        // CUDART_VERSION
+  int cuda_driver = 0;         // cudaDriverGetVersion(), diagnostic only
+  std::string ort_version;     // ORT_VERSION (strict-match field)
+  std::string ort_git_commit;  // parsed from ORT_BUILD_INFO or "unknown" (diagnostic only)
+  std::string ort_build_config;
+  std::string kernel_build;
 
   // Computes the signature for the current CUDA device and build.
   static HardwareSignature Compute();
 
   // Computes the signature for an already-queried device (avoids a cudaGetDeviceProperties call).
-  static HardwareSignature FromDevice(std::string device_name, int sm, int multiprocessor_count);
+  static HardwareSignature FromDevice(std::string device_name, int sm, int multiprocessor_count,
+                                      int l2_cache_bytes = 0);
 
-  // Strict reuse guard: device_name, sm, cuda_runtime, and ort_version must all match.
-  // multiprocessor_count, cuda_driver, ort_git_commit, and ort_build_config are recorded for
-  // diagnostics only and are NOT part of the guard: a tactic is just a config selected among
-  // getConfigs(), so a cross-commit/cross-build reuse can at worst pick a slightly suboptimal
-  // (never incorrect) tactic, and loadPersistentCache re-validates every CUTLASS tactic against
-  // the current runner and drops any that no longer applies.
+  // Driver and git commit are diagnostic; hardware capacity and kernel build features must match.
   bool StrictMatches(const HardwareSignature& other) const;
 
   // A filesystem-safe token derived from device_name + sm used as a default cache prefix.
@@ -132,19 +142,22 @@ std::optional<std::optional<CutlassGemmConfig>> ParseConfigColumns(
 // True if both are absent or both serialize to the same config columns.
 bool SameTactic(const std::optional<CutlassGemmConfig>& a, const std::optional<CutlassGemmConfig>& b);
 
+std::string CandidateSetFingerprint(const std::vector<CutlassGemmConfig>& configs, bool gemv_enabled);
+
 // Problem key for MatMulNBits fpA_intB. Many nodes with the same shape collapse to
-// one entry. n_16b is the value used by GemmIdCore (N after casting int weight to fp16).
+// one entry. n is the logical output width, independent of the packed storage size.
 struct MatMulNBitsKey {
-  int n_16b = 0;
+  int n = 0;
   int k = 0;
   std::string activation_dtype;  // "half" / "bfloat16"
   std::string weight_type;       // "uint2b_t" / "uint4b_t" / "uint8_t"
   int bits = 0;
   int block_size = 0;
   bool has_zero_points = false;
-  std::string zero_point_dtype;  // e.g. "uint4b_t" / activation dtype / "none"
+  bool has_bias = false;
   bool gemv_enabled = false;
   int packing_sm = 0;
+  std::string candidate_fingerprint;
 
   bool operator==(const MatMulNBitsKey& o) const;
 };
@@ -158,7 +171,7 @@ struct MatMulNBitsKeyHash {
 // Lookup/merge semantics:
 //   * Get(key, m) -> outer nullopt means "not cached, must profile"; inner optional
 //     is the tactic (inner nullopt means "profiled, no valid tactic").
-//   * Put(key, m, config) records a bucket in memory.
+//   * Put(key, m, config) records a successful bucket in memory; failures are not persisted.
 //   * Flush() atomically merges the in-memory table into the on-disk file under a
 //     file lock so concurrent sessions tuning different shapes do not lose updates.
 class MatMulNBitsTacticCache {
@@ -192,12 +205,12 @@ class MatMulNBitsTacticCache {
   void Put(const MatMulNBitsKey& key, int m_bucket, const std::optional<CutlassGemmConfig>& config);
 
   // Loads rows from file_path_ whose header signature strictly matches signature_.
-  // A missing file or mismatched signature leaves the in-memory table untouched and
-  // returns OK (treated as an empty/rejected cache).
+  // Replaces clean rows with the file snapshot; local dirty rows are preserved.
+  // A missing file or mismatched signature is treated as an empty snapshot.
   onnxruntime::common::Status Load();
 
   // Loads again if the file changed on disk since the last Load() or Flush(), so a new session
-  // sees rows written by other processes. Rows already in memory win.
+  // sees rows written by other processes. Only local dirty rows win conflicts.
   onnxruntime::common::Status ReloadIfChanged();
 
   // Atomically merges the in-memory table with the current on-disk file and writes
@@ -217,8 +230,8 @@ class MatMulNBitsTacticCache {
 
   mutable std::mutex mutex_;
   std::unordered_map<MatMulNBitsKey, BucketMap, MatMulNBitsKeyHash> table_;
-  bool dirty_ = false;
-  size_t generation_ = 0;
+  std::unordered_map<MatMulNBitsKey, BucketMap, MatMulNBitsKeyHash> dirty_rows_;
+  std::mutex io_mutex_;
   std::optional<FileStamp> known_stamp_;
 };
 

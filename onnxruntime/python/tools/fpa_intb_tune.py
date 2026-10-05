@@ -31,6 +31,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import os
 import sys
@@ -117,44 +118,43 @@ def _summarize_cache(cache_path: str) -> None:
         return
 
     header = {}
-    columns = None
-    n_key_col = None
     rows = 0
     unique_keys = set()
     with open(cache_path, encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.rstrip("\n")
-            if not line:
-                continue
-            if line.startswith("#"):
-                parts = line[1:].strip().split("\t")
-                if len(parts) >= 2:
-                    header[parts[0]] = parts[1]
-                continue
-            fields = line.split("\t")
-            if columns is None:
-                columns = fields
-                n_key_col = {name: i for i, name in enumerate(columns)}
-                continue
+
+        def data_lines():
+            for line in f:
+                if line.startswith("#"):
+                    parts = line[1:].strip().split("\t", 1)
+                    if len(parts) == 2:
+                        header[parts[0]] = parts[1]
+                elif line.strip():
+                    yield line
+
+        for fields in csv.DictReader(data_lines(), delimiter="\t"):
             rows += 1
             # Build a key tuple from the problem-key columns for a unique-shape count.
             key_cols = [
-                "n_16b",
+                "n",
                 "k",
                 "activation_dtype",
                 "weight_type",
                 "bits",
                 "block_size",
                 "has_zero_points",
+                "has_bias",
                 "gemv_enabled",
                 "packing_sm",
+                "candidate_fingerprint",
             ]
-            key = tuple(fields[n_key_col[c]] for c in key_cols if c in n_key_col)
+            key = tuple(fields.get(column) for column in key_cols)
             unique_keys.add(key)
 
     print(f"Cache written: {cache_path}")
     print(f"  device_name      : {header.get('device_name', '?')}")
     print(f"  sm               : {header.get('sm', '?')}")
+    print(f"  format           : {header.get('ort_cuda_gemm_tactic_cache', '?')}")
+    print(f"  timing_mode      : {header.get('timing_mode', '?')}")
     print(f"  cuda_runtime     : {header.get('cuda_runtime', '?')}")
     print(f"  ort_version      : {header.get('ort_version', '?')}")
     print(f"  ort_git_commit   : {header.get('ort_git_commit', '?')}")
@@ -204,7 +204,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--m-values",
-        default="1,2,4,8,16,32,64,128,256,512,1024,2048",
+        default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128,256,512,1024,2048",
         help="Comma-separated M buckets to profile (sets ep.cuda.fpa_intb_profile_m).",
     )
     parser.add_argument(

@@ -2,15 +2,15 @@
 // Licensed under the MIT License.
 
 // Unit tests for the fpA_intB / MatMulNBits GEMM tactic cache utilities.
-// These are pure-logic tests (no GPU required): HardwareSignature is constructed
-// manually and only the (de)serialization, TSV parsing, and file round-trip paths
-// are exercised.
+// Most tests are pure logic: HardwareSignature is constructed manually. The
+// profiling-loop smoke test uses CUDA events and skips when no GPU is available.
 //
 // Built into onnxruntime_providers_cuda_ut (onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS=ON); run like:
 //  ./onnxruntime_provider_test --gtest_filter=CUDA_EP_Unittest.All
 #if USE_FPA_INTB_GEMM
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +20,7 @@
 
 #include "contrib_ops/cuda/llm/gemm_tactic_cache.h"
 #include "contrib_ops/cuda/llm/gemm_profiler.h"
+#include "contrib_ops/cuda/llm/fpA_intB_gemm_profiler.h"
 
 namespace onnxruntime {
 namespace test {
@@ -34,31 +35,45 @@ using onnxruntime::llm::cutlass_extensions::SplitKStyle;
 
 namespace {
 
+class CacheTestProfiler : public onnxruntime::llm::kernels::weight_only::GemmPluginProfiler<
+                              CutlassGemmConfig, void*, onnxruntime::llm::kernels::weight_only::GemmIdCore,
+                              onnxruntime::llm::kernels::weight_only::GemmIdCoreHash> {
+ public:
+  size_t launches = 0;
+
+ protected:
+  void runTactic(int, int, int, const CutlassGemmConfig&, char*, const cudaStream_t&) override { ++launches; }
+  size_t computeTmpSize(size_t, size_t, size_t) override { return 0; }
+  std::vector<CutlassGemmConfig> getTactics(int, int, int) const override { return {CutlassGemmConfig{}}; }
+};
+
 gc::HardwareSignature MakeSignature(const std::string& device_name = "TEST GPU 4090", int sm = 80) {
   gc::HardwareSignature sig;
   sig.device_name = device_name;
   sig.sm = sm;
   sig.multiprocessor_count = 108;
+  sig.l2_cache_bytes = 40 << 20;
   sig.cuda_runtime = 13000;
   sig.cuda_driver = 13000;
   sig.ort_version = "1.28.0";
   sig.ort_git_commit = "deadbeef";
   sig.ort_build_config = "Release";
+  sig.kernel_build = "test_compact";
   return sig;
 }
 
-gc::MatMulNBitsKey MakeKey(int n_16b = 3072, int k = 4096) {
+gc::MatMulNBitsKey MakeKey(int n = 12288, int k = 4096) {
   gc::MatMulNBitsKey key;
-  key.n_16b = n_16b;
+  key.n = n;
   key.k = k;
   key.activation_dtype = "half";
   key.weight_type = "uint4b_t";
   key.bits = 4;
   key.block_size = 64;
   key.has_zero_points = true;
-  key.zero_point_dtype = "uint4b_t";
   key.gemv_enabled = true;
   key.packing_sm = 80;
+  key.candidate_fingerprint = "test_candidates";
   return key;
 }
 
@@ -214,8 +229,7 @@ TEST(GemmTacticCacheTest, StoreLoadRoundTrip) {
   ExpectConfigEqual(MakeSm90Config(), **c64);
 
   auto c128 = reloaded.Get(key, 128);
-  ASSERT_TRUE(c128.has_value());    // present in the cache
-  EXPECT_FALSE(c128->has_value());  // but no valid tactic
+  EXPECT_FALSE(c128.has_value());
 
   EXPECT_FALSE(reloaded.Get(key, 999).has_value());  // never profiled
 
@@ -246,7 +260,7 @@ TEST(GemmTacticCacheTest, SignatureMismatchRejected) {
   CleanUp(file);
 }
 
-TEST(GemmTacticCacheTest, GitCommitAndBuildConfigNotStrict) {
+TEST(GemmTacticCacheTest, GitCommitNotStrictButBuildConfigStrict) {
   const std::string prefix = UniqueTempPrefix("nonstrict");
   const std::string file = prefix + ".matmulnbits_fpa_intb.tsv";
   const gc::MatMulNBitsKey key = MakeKey();
@@ -265,10 +279,15 @@ TEST(GemmTacticCacheTest, GitCommitAndBuildConfigNotStrict) {
   // ort_version, must still accept the cache: those two fields are diagnostic-only.
   gc::HardwareSignature reader = MakeSignature();
   reader.ort_git_commit = "commit_bbbb";
-  reader.ort_build_config = "Debug";
+  reader.ort_build_config = "Release";
   gc::MatMulNBitsTacticCache reloaded(file, reader);
   ASSERT_TRUE(reloaded.Load().IsOK());
   EXPECT_TRUE(reloaded.Get(key, 1).has_value());
+
+  reader.ort_build_config = "Debug";
+  gc::MatMulNBitsTacticCache debug(file, reader);
+  ASSERT_TRUE(debug.Load().IsOK());
+  EXPECT_FALSE(debug.Get(key, 1).has_value());
 
   // A different ort_version is still rejected (it remains part of the strict guard).
   gc::HardwareSignature other_version = MakeSignature();
@@ -428,6 +447,15 @@ TEST(GemmTacticCacheTest, GemmIdCoreSeparatesQuantVariants) {
   EXPECT_FALSE(base == GemmIdCore(1024, 4096, dtype, 80, 4, 128, false, true));
   EXPECT_FALSE(base == GemmIdCore(1024, 4096, dtype, 80, 4, 64, true, true));
   EXPECT_FALSE(base == GemmIdCore(1024, 4096, dtype, 80, 4, 64, false, false));
+  auto other = base;
+  other.has_bias = true;
+  EXPECT_FALSE(base == other);
+  other = base;
+  other.device_uuid[0] = 1;
+  EXPECT_FALSE(base == other);
+  other = base;
+  other.candidate_fingerprint = "new_candidates";
+  EXPECT_FALSE(base == other);
 }
 
 TEST(GemmTacticCacheTest, ParseCacheAccessAndFlag) {
@@ -519,6 +547,252 @@ TEST(GemmTacticCacheTest, FlushAdoptsRowsFromOtherWriters) {
   EXPECT_TRUE(self.Get(key, 64).has_value());
 
   CleanUp(file);
+}
+
+TEST(GemmTacticCacheTest, ReloadReplacesCleanRowsAndPreservesDirtyRows) {
+  const std::string file = UniqueTempPrefix("replace") + ".matmulnbits_fpa_intb.tsv";
+  const auto sig = MakeSignature();
+  const auto key = MakeKey();
+  gc::MatMulNBitsTacticCache reader(file, sig);
+  reader.Put(key, 1, MakeSm80Config());
+  reader.Put(key, 8, MakeSm80Config());
+  ASSERT_TRUE(reader.Flush().IsOK());
+  reader.Put(key, 8, MakeSm90Config());
+
+  gc::MatMulNBitsTacticCache writer(file, sig);
+  writer.Put(key, 1, MakeSm90Config());
+  ASSERT_TRUE(writer.Flush().IsOK());
+  ASSERT_TRUE(reader.Load().IsOK());
+  ASSERT_TRUE(reader.Get(key, 1)->has_value());
+  ExpectConfigEqual(MakeSm90Config(), **reader.Get(key, 1));
+  ExpectConfigEqual(MakeSm90Config(), **reader.Get(key, 8));
+  CleanUp(file);
+}
+
+TEST(GemmTacticCacheTest, FlushDoesNotResurrectCleanRows) {
+  const std::string file = UniqueTempPrefix("dirtymerge") + ".matmulnbits_fpa_intb.tsv";
+  const auto sig = MakeSignature();
+  const auto key = MakeKey();
+  gc::MatMulNBitsTacticCache reader(file, sig);
+  reader.Put(key, 1, MakeSm80Config());
+  ASSERT_TRUE(reader.Flush().IsOK());
+
+  gc::MatMulNBitsTacticCache writer(file, sig);
+  writer.Put(key, 1, MakeSm90Config());
+  ASSERT_TRUE(writer.Flush().IsOK());
+  reader.Put(key, 64, MakeSm80Config());
+  ASSERT_TRUE(reader.Flush().IsOK());
+
+  gc::MatMulNBitsTacticCache reloaded(file, sig);
+  ASSERT_TRUE(reloaded.Load().IsOK());
+  ASSERT_TRUE(reloaded.Get(key, 1)->has_value());
+  ExpectConfigEqual(MakeSm90Config(), **reloaded.Get(key, 1));
+  ExpectConfigEqual(MakeSm90Config(), **reader.Get(key, 1));
+  EXPECT_TRUE(reloaded.Get(key, 64).has_value());
+  CleanUp(file);
+}
+
+TEST(GemmTacticCacheTest, HardwareCapacityAndKernelBuildAreStrict) {
+  const auto base = MakeSignature();
+  auto other = base;
+  other.multiprocessor_count -= 1;
+  EXPECT_FALSE(base.StrictMatches(other));
+  other = base;
+  other.l2_cache_bytes /= 2;
+  EXPECT_FALSE(base.StrictMatches(other));
+  other = base;
+  other.kernel_build = "full";
+  EXPECT_FALSE(base.StrictMatches(other));
+}
+
+TEST(GemmTacticCacheTest, CandidateFingerprintIsStableAndSensitiveToEligibility) {
+  auto first = MakeSm80Config();
+  auto second = MakeSm90Config();
+  auto gemv = first;
+  gemv.enableCudaKernel = true;
+  EXPECT_EQ(gc::CandidateSetFingerprint({first, second}, true),
+            gc::CandidateSetFingerprint({second, first, first}, true));
+  EXPECT_NE(gc::CandidateSetFingerprint({first}, true), gc::CandidateSetFingerprint({first, second}, true));
+  EXPECT_NE(gc::CandidateSetFingerprint({first, gemv}, true), gc::CandidateSetFingerprint({first, gemv}, false));
+  EXPECT_EQ(gc::CandidateSetFingerprint({first}, false), gc::CandidateSetFingerprint({first, gemv}, false));
+}
+
+TEST(GemmTacticCacheTest, KeySeparatesBiasAndCandidates) {
+  const auto base = MakeKey();
+  auto other = base;
+  other.has_bias = true;
+  EXPECT_FALSE(base == other);
+  other = base;
+  other.candidate_fingerprint = "new_candidates";
+  EXPECT_FALSE(base == other);
+}
+
+TEST(GemmTacticCacheTest, V2RejectsOldOrMissingIdentityAndAcceptsReorderedColumns) {
+  const std::string file = UniqueTempPrefix("v2") + ".matmulnbits_fpa_intb.tsv";
+  const auto sig = MakeSignature();
+  const auto key = MakeKey();
+  gc::MatMulNBitsTacticCache writer(file, sig);
+  writer.Put(key, 1, MakeSm80Config());
+  ASSERT_TRUE(writer.Flush().IsOK());
+  std::vector<std::string> original;
+  std::ifstream input(file);
+  std::string line;
+  while (std::getline(input, line)) {
+    original.push_back(line);
+  }
+  input.close();
+
+  for (const auto& changed_header : {std::string("ort_cuda_gemm_tactic_cache"),
+                                     std::string("kernel_implementation_version"), std::string("timing_mode"),
+                                     std::string("m_bucket_policy"), std::string("kernel_abi_version"),
+                                     std::string("config_codec_version"), std::string("runner_family"),
+                                     std::string("cache_conditioning_policy")}) {
+    std::ofstream output(file, std::ios::trunc);
+    for (const auto& original_line : original) {
+      output << (original_line.rfind("# " + changed_header + '\t', 0) == 0
+                     ? "# " + changed_header + "\tstale"
+                     : original_line)
+             << '\n';
+    }
+    output.close();
+    gc::MatMulNBitsTacticCache rejected(file, sig);
+    ASSERT_TRUE(rejected.Load().IsOK());
+    EXPECT_FALSE(rejected.Get(key, 1).has_value()) << changed_header;
+  }
+
+  std::ofstream output(file, std::ios::trunc);
+  for (const auto& original_line : original) {
+    if (!original_line.empty() && original_line[0] != '#') {
+      std::vector<std::string> fields;
+      std::istringstream columns(original_line);
+      std::string field;
+      while (std::getline(columns, field, '\t')) {
+        fields.push_back(field);
+      }
+      std::reverse(fields.begin(), fields.end());
+      for (size_t index = 0; index < fields.size(); ++index) {
+        output << (index == 0 ? "" : "\t") << fields[index];
+      }
+      output << '\n';
+    } else {
+      output << original_line << '\n';
+    }
+  }
+  output.close();
+  gc::MatMulNBitsTacticCache reordered(file, sig);
+  ASSERT_TRUE(reordered.Load().IsOK());
+  ASSERT_TRUE(reordered.Get(key, 1).has_value());
+  ExpectConfigEqual(MakeSm80Config(), **reordered.Get(key, 1));
+  CleanUp(file);
+}
+
+TEST(GemmTacticCacheTest, RetuneAndPersistentSnapshotsIsolateProfilesWithoutChangingLiveSelections) {
+  using onnxruntime::llm::kernels::weight_only::GemmIdCore;
+  const GemmIdCore key(1024, 4096, onnxruntime::llm::nvinfer::DataType::kHALF);
+  const auto shared = std::make_shared<CacheTestProfiler::MNKProfileMap>();
+  shared->createMProfileMap(key);
+  shared->getMProfileMap(key)->emplace(1, MakeSm80Config());
+  CacheTestProfiler live;
+  live.setSelectionTactics(shared);
+
+  for (const auto access : {gc::CacheAccess{false, true}, gc::CacheAccess{true, false}, gc::CacheAccess{true, true}}) {
+    const bool persistent = access.load;
+    EXPECT_TRUE(access.RequiresIsolatedProfiles(persistent));
+    CacheTestProfiler next;
+    next.setSelectionTactics(shared);
+    if (access.RequiresIsolatedProfiles(persistent)) {
+      next.resetSelectionTactics();
+    }
+    EXPECT_THROW(next.getBestConfig(1, key), OnnxRuntimeException);
+    ASSERT_TRUE(live.getBestConfig(1, key).has_value());
+    ExpectConfigEqual(MakeSm80Config(), *live.getBestConfig(1, key));
+  }
+  EXPECT_FALSE(gc::CacheAccess{}.RequiresIsolatedProfiles(false));
+}
+
+TEST(GemmTacticCacheTest, GemvBucketsDoNotCrossEligibilityBoundary) {
+  using onnxruntime::llm::kernels::weight_only::WeightOnlyGroupwiseQuantGemmPluginProfiler;
+  const auto buckets = WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMBuckets(1, 32, {}, true);
+  for (int rows = 1; rows <= 15; ++rows) {
+    EXPECT_NE(std::find(buckets.begin(), buckets.end(), rows), buckets.end());
+    EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(rows, true), rows);
+  }
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(16, true), 16);
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(17, true), 32);
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(9, false), 16);
+  EXPECT_EQ(WeightOnlyGroupwiseQuantGemmPluginProfiler::GetProfileMForRequest(0, true), 1);
+}
+
+TEST(GemmTacticCacheTest, CudaGemvConfigUsesCanonicalFamilyIdentity) {
+  auto first = MakeSm80Config();
+  first.enableCudaKernel = true;
+  auto second = MakeSm90Config();
+  second.enableCudaKernel = true;
+  EXPECT_TRUE(gc::SameTactic(first, second));
+  EXPECT_EQ(gc::CandidateSetFingerprint({first}, true), gc::CandidateSetFingerprint({second}, true));
+  const std::string file = UniqueTempPrefix("gemvfamily") + ".matmulnbits_fpa_intb.tsv";
+  gc::MatMulNBitsTacticCache writer(file, MakeSignature());
+  writer.Put(MakeKey(), 1, first);
+  ASSERT_TRUE(writer.Flush().IsOK());
+  gc::MatMulNBitsTacticCache reader(file, MakeSignature());
+  ASSERT_TRUE(reader.Load().IsOK());
+  ASSERT_TRUE(reader.Get(MakeKey(), 1).has_value());
+  EXPECT_TRUE(gc::SameTactic(**reader.Get(MakeKey(), 1), second));
+  CleanUp(file);
+}
+
+TEST(GemmTacticCacheTest, SessionProfileMapsDeduplicateOnlyWithinOneLiveSession) {
+  using onnxruntime::llm::kernels::weight_only::GemmPluginProfilerManager;
+  GemmPluginProfilerManager<CacheTestProfiler> manager;
+  const int first_session = 1;
+  const int second_session = 2;
+  auto first_map = manager.getSessionProfileMap(&first_session);
+  EXPECT_EQ(first_map, manager.getSessionProfileMap(&first_session));
+  EXPECT_NE(first_map, manager.getSessionProfileMap(&second_session));
+  using onnxruntime::llm::kernels::weight_only::GemmIdCore;
+  const GemmIdCore key(1024, 4096, onnxruntime::llm::nvinfer::DataType::kHALF);
+  first_map->createMProfileMap(key);
+  first_map->getMProfileMap(key)->emplace(1, MakeSm80Config());
+  auto second_map = manager.getSessionProfileMap(&second_session);
+  EXPECT_FALSE(second_map->existsMProfileMap(key));
+  first_map.reset();
+  EXPECT_FALSE(manager.getSessionProfileMap(&first_session)->existsMProfileMap(key));
+}
+
+TEST(GemmTacticCacheTest, RetuneProfilesAgainWhileSameSessionReusesActualProfilingLoop) {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    GTEST_SKIP() << "CUDA events are required for the profiling-loop smoke test.";
+  }
+  using namespace onnxruntime::llm::kernels::weight_only;
+  GemmPluginProfilerManager<CacheTestProfiler> manager;
+  const int first_session = 1;
+  const int retune_session = 2;
+  const auto dtype = onnxruntime::llm::nvinfer::DataType::kHALF;
+  const GemmIdCore key(1024, 4096, dtype);
+  const GemmDims dims(1, 1, 1024, 4096);
+  const auto allocator = std::make_shared<CPUAllocator>();
+  auto first = manager.createGemmPluginProfiler(false);
+  first->setSelectionTactics(manager.getSessionProfileMap(&first_session));
+  first->setAllocator(allocator);
+  first->profileTactics(nullptr, dtype, dims, key);
+  EXPECT_GT(first->launches, 0u);
+
+  auto same_session = manager.createGemmPluginProfiler(false);
+  same_session->setSelectionTactics(manager.getSessionProfileMap(&first_session));
+  same_session->setAllocator(allocator);
+  same_session->profileTactics(nullptr, dtype, dims, key);
+  EXPECT_EQ(same_session->launches, 0u);
+
+  auto retune = manager.createGemmPluginProfiler(false);
+  const auto access = gc::ParseCacheAccess("save");
+  ASSERT_TRUE(access.has_value());
+  ASSERT_TRUE(access->RequiresIsolatedProfiles(true));
+  retune->setSelectionTactics(manager.getSessionProfileMap(&retune_session));
+  retune->setAllocator(allocator);
+  retune->profileTactics(nullptr, dtype, dims, key);
+  EXPECT_GT(retune->launches, 0u);
+  EXPECT_TRUE(first->getBestConfig(1, key).has_value());
 }
 
 }  // namespace test

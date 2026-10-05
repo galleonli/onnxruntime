@@ -129,13 +129,18 @@ size_t WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(size_t maxM, s
 
 std::vector<WeightOnlyGroupwiseQuantGemmPluginProfiler::Config> WeightOnlyGroupwiseQuantGemmPluginProfiler::getTactics(
     int /*m*/, int /*n*/, int /*k*/) const {
-  return mRunner->getConfigs();
+  auto configs = mRunner->getConfigs();
+  configs.erase(std::remove_if(configs.begin(), configs.end(), [this](const auto& config) {
+                  return config.enableCudaKernel && !mGemvEnabled;
+                }),
+                configs.end());
+  return configs;
 }
 
 bool WeightOnlyGroupwiseQuantGemmPluginProfiler::checkTactic(int m, int /*n*/, int /*k*/, Config const& tactic) const {
   // stop to profile Cuda kernel for m >= 16
   if (tactic.enableCudaKernel) {
-    return m < 16;
+    return mGemvEnabled && m > 0 && m < 16;
   }
   return true;
 }
@@ -181,12 +186,12 @@ std::vector<int> WeightOnlyGroupwiseQuantGemmPluginProfiler::ParseProfileMList(c
 }
 
 std::vector<int> WeightOnlyGroupwiseQuantGemmPluginProfiler::getProfileMBuckets(
-    int minM, int maxM, bool /*hasWeightOnlyCudaKernel*/) const {
-  return GetInitialProfileMBuckets(minM, maxM, mProfileMOverride);
+    int minM, int maxM, bool hasWeightOnlyCudaKernel) const {
+  return GetInitialProfileMBuckets(minM, maxM, mProfileMOverride, hasWeightOnlyCudaKernel);
 }
 
 std::vector<int> WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMBuckets(
-    int min_m, int max_m, const std::vector<int>& profile_m_override) {
+    int min_m, int max_m, const std::vector<int>& profile_m_override, bool gemv_enabled) {
   int const lo = std::max(1, min_m);
   int const hi = std::max(lo, max_m);
 
@@ -204,6 +209,11 @@ std::vector<int> WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMB
         buckets.insert(m);
       }
     }
+    if (gemv_enabled) {
+      for (int m = lo; m <= std::min(15, hi); ++m) {
+        buckets.insert(m);
+      }
+    }
   }
 
   // Always include the decode bucket (M=1) and the top bucket so both extremes are tuned.
@@ -216,7 +226,7 @@ std::vector<int> WeightOnlyGroupwiseQuantGemmPluginProfiler::GetInitialProfileMB
 onnxruntime::llm::gemm_cache::MatMulNBitsKey WeightOnlyGroupwiseQuantGemmPluginProfiler::makeCacheKey(
     GemmIdCore const& gemmId, bool hasWeightOnlyCudaKernel) const {
   onnxruntime::llm::gemm_cache::MatMulNBitsKey key;
-  key.n_16b = gemmId.n;
+  key.n = SafeInt<int>(gemmId.n) * (FP16_BITS / mQuantBits);
   key.k = gemmId.k;
   key.activation_dtype = (gemmId.dtype == onnxruntime::llm::nvinfer::DataType::kBF16) ? "bfloat16" : "half";
   key.weight_type = (mQuantBits == INT8_BITS)   ? "uint8_t"
@@ -225,9 +235,10 @@ onnxruntime::llm::gemm_cache::MatMulNBitsKey WeightOnlyGroupwiseQuantGemmPluginP
   key.bits = mQuantBits;
   key.block_size = mGroupSize;
   key.has_zero_points = mHasZeros;
-  key.zero_point_dtype = mHasZeros ? key.weight_type : "none";
+  key.has_bias = gemmId.has_bias;
   key.gemv_enabled = hasWeightOnlyCudaKernel;
   key.packing_sm = mArch;
+  key.candidate_fingerprint = gemmId.candidate_fingerprint;
   return key;
 }
 
@@ -242,21 +253,10 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::loadPersistentCache(
     return;
   }
 
-  // Validate CUTLASS tactics loaded from disk against the tactics this runner can actually
-  // dispatch. A parseable-but-incompatible cache row (e.g. hand-edited, or written by a build
-  // whose signature happens to match but whose tactic set differs) would otherwise be handed
-  // straight to the kernel. Non-matching CUTLASS tactics are dropped so the bucket is re-profiled.
-  // The synthetic CUDA-GEMV tactic (enableCudaKernel) is not part of getConfigs(); its validity
-  // is already keyed by gemv_enabled in the cache key, so it is accepted as-is.
   auto const valid_configs = getTactics(0, gemmId.n, gemmId.k);
-  auto is_valid_cutlass = [&valid_configs](Config const& c) {
-    for (auto const& v : valid_configs) {
-      if (v.sm_version == c.sm_version && v.is_tma_warp_specialized == c.is_tma_warp_specialized &&
-          v.tile_config_sm80 == c.tile_config_sm80 && v.tile_config_sm90 == c.tile_config_sm90 &&
-          v.tile_config_sm100 == c.tile_config_sm100 && v.tile_config_sm120 == c.tile_config_sm120 &&
-          v.split_k_style == c.split_k_style && v.split_k_factor == c.split_k_factor &&
-          v.stages == c.stages && v.cluster_shape == c.cluster_shape &&
-          v.mainloop_schedule == c.mainloop_schedule && v.epilogue_schedule == c.epilogue_schedule) {
+  auto is_valid = [&valid_configs](Config const& config) {
+    for (const auto& candidate : valid_configs) {
+      if (onnxruntime::llm::gemm_cache::SameTactic(config, candidate)) {
         return true;
       }
     }
@@ -269,7 +269,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::loadPersistentCache(
         ORT_LLM_LOG_WARNING("Dropping unsupported cached fpA_intB tactic from the tactic cache; re-profiling.");
         continue;
       }
-      if (!config->enableCudaKernel && !is_valid_cutlass(*config)) {
+      if (!is_valid(*config)) {
         ORT_LLM_LOG_WARNING("Dropping incompatible cached fpA_intB tactic from the tactic cache; re-profiling.");
         continue;
       }

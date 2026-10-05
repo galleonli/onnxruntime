@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -103,6 +104,9 @@ class GemmIdCore {
   int group_size;
   bool has_zeros;
   bool gemv_enabled;
+  bool has_bias = false;
+  std::array<char, 16> device_uuid{};
+  std::string candidate_fingerprint;
 
   GemmIdCore(int n_, int k_, nvinfer::DataType const& dtype_, int sm_ = 0, int bits_ = 0, int group_size_ = 0,
              bool has_zeros_ = false, bool gemv_enabled_ = false)
@@ -134,7 +138,8 @@ class GemmIdCore {
  protected:
   bool isEqual(GemmIdCore const& id) const {
     return n == id.n && k == id.k && dtype == id.dtype && sm == id.sm && bits == id.bits &&
-           group_size == id.group_size && has_zeros == id.has_zeros && gemv_enabled == id.gemv_enabled;
+           group_size == id.group_size && has_zeros == id.has_zeros && gemv_enabled == id.gemv_enabled &&
+           has_bias == id.has_bias && device_uuid == id.device_uuid && candidate_fingerprint == id.candidate_fingerprint;
   }
 };
 
@@ -147,7 +152,16 @@ struct GemmIdCoreHash {
     auto h4 = std::hash<int>{}(id.sm);
     auto h5 = std::hash<int>{}((id.bits << 16) ^ (id.group_size << 2) ^ (id.has_zeros ? 2 : 0) ^
                                (id.gemv_enabled ? 1 : 0));
-    return h1 ^ h2 ^ h3 ^ h4 ^ h5;
+    size_t seed = h1 ^ h2 ^ h3 ^ h4 ^ h5;
+    auto combine = [&seed](size_t value) {
+      seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    };
+    combine(std::hash<bool>{}(id.has_bias));
+    combine(std::hash<std::string>{}(id.candidate_fingerprint));
+    for (unsigned char value : id.device_uuid) {
+      combine(value);
+    }
+    return seed;
   }
 };
 
@@ -206,6 +220,10 @@ class GemmPluginProfiler {
     mMNKProfileMap = map;
   }
 
+  void resetSelectionTactics() {
+    mMNKProfileMap = std::make_shared<MNKProfileMap>();
+  }
+
   void setSkip(bool skip) {
     mSkip = mSkip || skip;
   }
@@ -226,6 +244,10 @@ class GemmPluginProfiler {
   std::optional<Config> getBestConfigOrProfile(int m, GemmIdType const& gemmId);
 
   virtual int getMaxProfileM() const;
+
+  virtual int getProfileMForRequest(int m) const {
+    return RoundUpProfileM(std::max(1, m), getMaxProfileM());
+  }
 
  protected:
   virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
@@ -312,8 +334,28 @@ class GemmPluginProfilerManager {
     return profiler;
   }
 
+  MNKProfileMapPtr getSessionProfileMap(const void* session) {
+    std::lock_guard<std::mutex> lock(mSessionMutex);
+    for (auto iter = mSessionMaps.begin(); iter != mSessionMaps.end();) {
+      if (iter->second.expired()) {
+        iter = mSessionMaps.erase(iter);
+      } else {
+        ++iter;
+      }
+    }
+    auto& weak_map = mSessionMaps[session];
+    if (auto map = weak_map.lock()) {
+      return map;
+    }
+    auto map = std::make_shared<MNKProfileMap>();
+    weak_map = map;
+    return map;
+  }
+
  private:
   MNKProfileMapPtr mMNKProfileMap{};
+  std::mutex mSessionMutex;
+  std::unordered_map<const void*, std::weak_ptr<MNKProfileMap>> mSessionMaps;
 };
 
 }  // namespace onnxruntime::llm::kernels::weight_only
@@ -427,7 +469,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
     return std::nullopt;
   }
 
-  int const mRounded = RoundUpProfileM(std::max(1, m), getMaxProfileM());
+  int const mRounded = getProfileMForRequest(m);
   fflush(stdout);
 
   if (mMNKProfileMap->getMProfileMap(gemmId)->count(m) > 0) {
@@ -471,7 +513,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
     return std::nullopt;
   }
 
-  int const target = RoundUpProfileM(std::max(1, m), getMaxProfileM());
+  int const target = getProfileMForRequest(m);
 
   // Fast path: an already-profiled (exact or rounded) bucket under a shared read lock.
   {

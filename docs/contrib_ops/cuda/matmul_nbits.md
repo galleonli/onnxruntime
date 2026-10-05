@@ -534,15 +534,17 @@ Prepacked weights are intentionally strict:
 ## 6.1 fpA_intB Tactic Autotune Cache
 
 The fpA_intB profiler (§6) tunes CUTLASS/CUDA tactics per problem shape. By
-default this is in-process only and re-run every session. When a cache location
+default this is in-process only, shared for matching device/problem contexts. When a cache location
 is configured, tuned tactics are **persisted to disk** and reused across
 sessions, and the first-time tuning cost is reduced. Design details:
 [gemm_profiler_cache.md](gemm_profiler_cache.md).
 
 **Reduced first-time sweep + lazy fallback.** Instead of profiling a dense
 `M = 1 … 8291` sweep at construction, the profiler now tunes a small bucket set
-(`{1,2,4,…,2048}` by default, clamped to the problem range and always including
-`M=1` and the top bucket). If a runtime `M` maps to an unprofiled bucket, that
+(`M=1..15` when GEMV is eligible, then `{16,32,64,...,2048}`, clamped to the
+problem range and always including `M=1` and the top bucket). Small GEMV-eligible
+runtime M values are kept exact rather than rounded across the M=16 eligibility
+boundary. If a runtime `M` maps to an unprofiled bucket, that
 single bucket is profiled lazily on first use and kept in the in-process map for
 the rest of the session. Lazy profiling is skipped
 while a CUDA graph is being captured (profiling kernels/events/allocations are
@@ -556,6 +558,10 @@ profile range.
 `MatMulNBits` kernel loads matching tactics from the cache before profiling, so
 only missing buckets are tuned. If another session or process changed the cache
 file since this process last read or wrote it, the file is read again first.
+Clean cached rows are replaced by the new disk snapshot; local dirty rows win conflicts.
+Only dirty row deltas are merged when saving, so old loaded winners do not overwrite
+external re-tuning. Each persistent or re-tuning session has its own selection map,
+shared by its nodes, and new sessions do not change live sessions' selections.
 Newly tuned tactics (from the construction-time sweep and from lazy profiling)
 are only staged in memory while the session runs. They are written to disk once,
 when the session closes (`~CUDAExecutionProvider` for the built-in EP, `~CudaEp`
@@ -585,30 +591,34 @@ the same location share one cache, while sessions configured with different
 locations each get their own. Missing cache directories are created on the first
 write.
 
-**Stale-tactic guard.** On load, each CUTLASS tactic read from disk is checked
+**Stale-tactic guard.** On load, each CUTLASS or CUDA-GEMV tactic read from disk is checked
 against the tactics the current runner can actually dispatch (`getConfigs()`);
 any row that no longer matches is dropped and that bucket is re-profiled, so a
 parseable-but-incompatible cache row is never handed to the kernel.
+The problem key also includes bias mode and a normalized candidate-set fingerprint,
+so changes to the available candidates invalidate an old, still-executable winner.
+Profiling failures are not persisted.
 
 **File format.** A tab-separated file (`<prefix>.matmulnbits_fpa_intb.tsv`) with
-`#`-prefixed header lines carrying a format version and a hardware/build
-signature (GPU name, SM, CUDA runtime, ORT version/commit/build config), a
-column-name row, and one row per `(problem shape, M bucket) → tactic`. Readers
-map by column name, so appended columns are backward/forward compatible.
+`#`-prefixed header lines carrying format `v2` and hardware/build/profiling context,
+a column-name row, and one row per `(problem shape, M bucket) → tactic`.
+Logical `n` replaces packed `n_16b`. Results explicitly name `cutlass` or `cuda_gemv`
+and a configuration-codec version. All fields are read by name, so reordering and
+unknown non-identity metadata columns are supported. New identity fields require
+versioning; v1 files are rejected and re-tuned.
 
 **Hardware guard.** On load, the file's signature must strictly match the current
-`device_name`, `sm`, `cuda_runtime`, and `ort_version`; otherwise the file is
+`device_name`, physical `sm`, `multiprocessor_count`, `l2_cache_bytes`,
+`cuda_runtime`, `ort_version`, build configuration, and kernel build features; otherwise the file is
 ignored and shapes are re-profiled. This prevents reusing tactics across different
 GPUs or toolkit/ORT versions (e.g. RTX 4090 vs RTX 4060, which share `sm_89`).
-`ort_git_commit`, `ort_build_config`, `multiprocessor_count`, and `cuda_driver`
-are recorded in the header for diagnostics but are **not** part of the guard: a
-tactic is only a config selected among `getConfigs()`, so a cross-commit or
-cross-build reuse can at worst pick a slightly suboptimal (never incorrect)
-tactic, and the stale-tactic guard above re-validates every CUTLASS tactic
-against the current runner anyway. The header also carries a
-`tactic_selection_version` that must match exactly; it is bumped whenever the
-profiler's selection logic changes, so caches tuned under an older policy are
-re-profiled even when the ORT version is unchanged.
+`ort_git_commit` and `cuda_driver` are diagnostic. Separate strict kernel ABI,
+implementation, configuration-codec, and tactic-selection versions invalidate
+changes behind an unchanged configuration list. Timing, cache-conditioning,
+runner-family, and M-bucket policies also match exactly. Current results are
+synthetic stream measurements, not CUDA graph replay measurements. Device UUID
+isolates process-wide nonpersistent selections; portable disk caches do not
+require the same physical board.
 
 **Offline tuning tool.** To pre-populate a cache without running your own
 workload, use

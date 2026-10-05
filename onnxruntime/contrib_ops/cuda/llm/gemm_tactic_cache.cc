@@ -6,6 +6,7 @@
 #include "contrib_ops/cuda/llm/gemm_tactic_cache.h"
 
 #include <cuda_runtime_api.h>
+#include <cutlass/version.h>
 
 #include <algorithm>
 #include <atomic>
@@ -126,6 +127,51 @@ std::string CurrentBuildConfig() {
 #endif
 }
 
+std::string KernelBuildSignature() {
+  std::string signature;
+#if USE_COMPACT_FPA_INTB_GEMM
+  signature = "compact";
+#else
+  signature = "full";
+#endif
+#ifdef ORT_QUICK_BUILD
+  signature += ";quick";
+#endif
+#ifdef ENABLE_BF16
+  signature += ";bf16";
+#endif
+#ifdef EXCLUDE_SM_90
+  signature += ";no_sm90";
+#endif
+#ifdef EXCLUDE_SM_75
+  signature += ";no_sm75";
+#endif
+#ifdef EXCLUDE_SM_80
+  signature += ";no_sm80";
+#endif
+#ifdef EXCLUDE_SM_89
+  signature += ";no_sm89";
+#endif
+#ifdef EXCLUDE_SM_100
+  signature += ";no_sm100";
+#endif
+#ifdef EXCLUDE_SM_110
+  signature += ";no_sm110";
+#endif
+#ifdef EXCLUDE_SM_120
+  signature += ";no_sm120";
+#endif
+  signature += ";cutlass=" + std::to_string(CUTLASS_MAJOR) + "." + std::to_string(CUTLASS_MINOR) + "." +
+               std::to_string(CUTLASS_PATCH);
+  signature += ";compiler=";
+#ifdef _MSC_VER
+  signature += std::to_string(_MSC_VER);
+#else
+  signature += __VERSION__;
+#endif
+  return signature;
+}
+
 // Cache paths are UTF-8; convert explicitly so non-ASCII paths work on Windows.
 std::filesystem::path Utf8Path(const std::string& s) {
   return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
@@ -241,17 +287,19 @@ HardwareSignature HardwareSignature::Compute() {
   if (cudaGetDevice(&device) == cudaSuccess) {
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
-      return FromDevice(prop.name, prop.major * 10 + prop.minor, prop.multiProcessorCount);
+      return FromDevice(prop.name, prop.major * 10 + prop.minor, prop.multiProcessorCount, prop.l2CacheSize);
     }
   }
   return FromDevice(std::string(), 0, 0);
 }
 
-HardwareSignature HardwareSignature::FromDevice(std::string device_name, int sm, int multiprocessor_count) {
+HardwareSignature HardwareSignature::FromDevice(std::string device_name, int sm, int multiprocessor_count,
+                                                int l2_cache_bytes) {
   HardwareSignature sig;
   sig.device_name = std::move(device_name);
   sig.sm = sm;
   sig.multiprocessor_count = multiprocessor_count;
+  sig.l2_cache_bytes = l2_cache_bytes;
   sig.cuda_runtime = CUDART_VERSION;
   int driver = 0;
   if (cudaDriverGetVersion(&driver) == cudaSuccess) {
@@ -261,17 +309,19 @@ HardwareSignature HardwareSignature::FromDevice(std::string device_name, int sm,
   sig.ort_version = CurrentOrtVersion();
   sig.ort_git_commit = ExtractGitCommit(CurrentOrtBuildInfo());
   sig.ort_build_config = CurrentBuildConfig();
+  sig.kernel_build = KernelBuildSignature();
   return sig;
 }
 
 bool HardwareSignature::StrictMatches(const HardwareSignature& other) const {
-  // ort_git_commit and ort_build_config are intentionally excluded (diagnostic only): reusing a
-  // tactic across commits or build configs can at worst be slightly suboptimal, never incorrect,
-  // and loadPersistentCache re-validates each CUTLASS tactic against the current runner anyway.
   return device_name == other.device_name &&
          sm == other.sm &&
+         multiprocessor_count == other.multiprocessor_count &&
+         l2_cache_bytes == other.l2_cache_bytes &&
          cuda_runtime == other.cuda_runtime &&
-         ort_version == other.ort_version;
+         ort_version == other.ort_version &&
+         ort_build_config == other.ort_build_config &&
+         kernel_build == other.kernel_build;
 }
 
 std::string HardwareSignature::FilePrefixToken() const {
@@ -298,7 +348,8 @@ void AppendConfigColumns(std::vector<std::string>& row, const std::optional<Cutl
     return;
   }
 
-  const CutlassGemmConfig& c = *config;
+  CutlassGemmConfig c = config->enableCudaKernel ? CutlassGemmConfig{} : *config;
+  c.enableCudaKernel = config->enableCudaKernel;
   row.emplace_back("1");                                                    // valid_config
   row.emplace_back(std::to_string(c.sm_version));                           // sm_version
   row.emplace_back(std::to_string(static_cast<int>(c.tile_config_sm80)));   // tile80
@@ -333,6 +384,9 @@ std::optional<std::optional<CutlassGemmConfig>> ParseConfigColumns(
     // A profiled bucket with no valid tactic.
     return std::optional<CutlassGemmConfig>{std::nullopt};
   }
+  if (valid_config != 1 || (vals[12] != 0 && vals[12] != 1) || (vals[13] != 0 && vals[13] != 1)) {
+    return std::nullopt;
+  }
 
   CutlassGemmConfig c;
   c.sm_version = vals[1];
@@ -357,6 +411,29 @@ bool SameTactic(const std::optional<CutlassGemmConfig>& a, const std::optional<C
   AppendConfigColumns(row_a, a);
   AppendConfigColumns(row_b, b);
   return row_a == row_b;
+}
+
+std::string CandidateSetFingerprint(const std::vector<CutlassGemmConfig>& configs, bool gemv_enabled) {
+  std::vector<std::string> candidates;
+  for (const auto& config : configs) {
+    if (config.enableCudaKernel && !gemv_enabled) {
+      continue;
+    }
+    std::vector<std::string> columns;
+    AppendConfigColumns(columns, config);
+    candidates.push_back(JoinTabs(columns));
+  }
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+  uint64_t fingerprint = UINT64_C(14695981039346656037);
+  for (const auto& candidate : candidates) {
+    for (unsigned char value : candidate + '\n') {
+      fingerprint = (fingerprint ^ value) * UINT64_C(1099511628211);
+    }
+  }
+  std::ostringstream encoded;
+  encoded << std::hex << fingerprint;
+  return encoded.str();
 }
 
 namespace {
@@ -392,15 +469,16 @@ std::optional<bool> ParseCacheFlag(const std::string& value) {
 }
 
 bool MatMulNBitsKey::operator==(const MatMulNBitsKey& o) const {
-  return n_16b == o.n_16b && k == o.k &&
+  return n == o.n && k == o.k &&
          activation_dtype == o.activation_dtype && weight_type == o.weight_type &&
          bits == o.bits && block_size == o.block_size &&
-         has_zero_points == o.has_zero_points && zero_point_dtype == o.zero_point_dtype &&
-         gemv_enabled == o.gemv_enabled && packing_sm == o.packing_sm;
+         has_zero_points == o.has_zero_points && has_bias == o.has_bias &&
+         gemv_enabled == o.gemv_enabled && packing_sm == o.packing_sm &&
+         candidate_fingerprint == o.candidate_fingerprint;
 }
 
 std::size_t MatMulNBitsKeyHash::operator()(const MatMulNBitsKey& k) const {
-  std::size_t h = std::hash<int>{}(k.n_16b);
+  std::size_t h = std::hash<int>{}(k.n);
   auto mix = [&h](std::size_t v) {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
   };
@@ -410,19 +488,28 @@ std::size_t MatMulNBitsKeyHash::operator()(const MatMulNBitsKey& k) const {
   mix(std::hash<int>{}(k.bits));
   mix(std::hash<int>{}(k.block_size));
   mix(std::hash<bool>{}(k.has_zero_points));
-  mix(std::hash<std::string>{}(k.zero_point_dtype));
+  mix(std::hash<bool>{}(k.has_bias));
   mix(std::hash<bool>{}(k.gemv_enabled));
   mix(std::hash<int>{}(k.packing_sm));
+  mix(std::hash<std::string>{}(k.candidate_fingerprint));
   return h;
 }
 
 namespace {
 
+const std::vector<std::string>& ConfigColumnNames() {
+  static const std::vector<std::string> names = {
+      "valid_config", "sm_version", "tile80", "tile90", "tile100", "tile120",
+      "split_k_style", "split_k", "stages", "cluster", "mainloop", "epilogue", "tma", "enable_cuda_kernel"};
+  return names;
+}
+
 // Column names for the MatMulNBits data rows, in write order.
 const std::vector<std::string>& MatMulNBitsColumnNames() {
   static const std::vector<std::string> names = {
-      "n_16b", "k", "activation_dtype", "weight_type", "bits",
-      "block_size", "has_zero_points", "zero_point_dtype", "gemv_enabled", "packing_sm",
+      "n", "k", "activation_dtype", "weight_type", "bits",
+      "block_size", "has_zero_points", "has_bias", "gemv_enabled", "packing_sm", "candidate_fingerprint",
+      "result_status", "kernel_family", "kernel_config_version",
       "m_bucket", "valid_config", "sm_version", "tile80", "tile90", "tile100", "tile120",
       "split_k_style", "split_k", "stages", "cluster", "mainloop", "epilogue", "tma",
       "enable_cuda_kernel"};
@@ -497,20 +584,30 @@ MatMulNBitsTacticCache::BucketMap MatMulNBitsTacticCache::GetAll(const MatMulNBi
 
 void MatMulNBitsTacticCache::Put(const MatMulNBitsKey& key, int m_bucket,
                                  const std::optional<CutlassGemmConfig>& config) {
+  if (!config.has_value()) {
+    return;
+  }
   std::lock_guard<std::mutex> guard(mutex_);
   table_[key][m_bucket] = config;
-  dirty_ = true;
-  ++generation_;
+  dirty_rows_[key][m_bucket] = config;
 }
 
 onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
+  std::lock_guard<std::mutex> io_guard(io_mutex_);
   const auto stamp = CurrentFileStamp();
-  {
+  auto adopt_snapshot = [&](auto loaded) {
     std::lock_guard<std::mutex> guard(mutex_);
+    table_ = std::move(loaded);
+    for (const auto& [key, buckets] : dirty_rows_) {
+      for (const auto& [m, config] : buckets) {
+        table_[key][m] = config;
+      }
+    }
     known_stamp_ = stamp;
-  }
+  };
   std::ifstream in(Utf8Path(file_path_));
   if (!in.is_open()) {
+    adopt_snapshot(decltype(table_){});
     return onnxruntime::common::Status::OK();
   }
 
@@ -518,6 +615,7 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
   file_sig.ort_build_config.clear();
   std::string magic_ok_version;
   std::string selection_version;
+  std::unordered_map<std::string, std::string> context;
   std::string table_name;
   std::vector<std::string> header_columns;
   std::unordered_map<MatMulNBitsKey, BucketMap, MatMulNBitsKeyHash> loaded;
@@ -542,6 +640,7 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
       if (fields.size() >= 2) {
         const std::string& k = fields[0];
         const std::string& v = fields[1];
+        context[k] = v;
         if (k == kCacheMagic) {
           magic_ok_version = v;
         } else if (k == "table") {
@@ -554,6 +653,8 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
           ParseInt(v, file_sig.sm);
         } else if (k == "multiprocessor_count") {
           ParseInt(v, file_sig.multiprocessor_count);
+        } else if (k == "l2_cache_bytes") {
+          ParseInt(v, file_sig.l2_cache_bytes);
         } else if (k == "cuda_runtime") {
           ParseInt(v, file_sig.cuda_runtime);
         } else if (k == "cuda_driver") {
@@ -564,6 +665,8 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
           file_sig.ort_git_commit = v;
         } else if (k == "ort_build_config") {
           file_sig.ort_build_config = v;
+        } else if (k == "kernel_build") {
+          file_sig.kernel_build = TsvDecode(v);
         }
       }
       continue;
@@ -571,6 +674,12 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
 
     if (header_columns.empty()) {
       header_columns = SplitTabs(line);
+      auto sorted_columns = header_columns;
+      std::sort(sorted_columns.begin(), sorted_columns.end());
+      if (std::adjacent_find(sorted_columns.begin(), sorted_columns.end()) != sorted_columns.end()) {
+        adopt_snapshot(decltype(table_){});
+        return onnxruntime::common::Status::OK();
+      }
       continue;
     }
 
@@ -586,7 +695,7 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
     };
 
     MatMulNBitsKey key;
-    if (!ParseInt(field("n_16b"), key.n_16b) || !ParseInt(field("k"), key.k) ||
+    if (!ParseInt(field("n"), key.n) || !ParseInt(field("k"), key.k) ||
         !ParseInt(field("bits"), key.bits) || !ParseInt(field("block_size"), key.block_size) ||
         !ParseInt(field("packing_sm"), key.packing_sm)) {
       continue;
@@ -594,28 +703,33 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
     key.activation_dtype = TsvDecode(field("activation_dtype"));
     key.weight_type = TsvDecode(field("weight_type"));
     int has_zp = 0;
-    ParseInt(field("has_zero_points"), has_zp);
-    key.has_zero_points = has_zp != 0;
-    key.zero_point_dtype = TsvDecode(field("zero_point_dtype"));
+    int has_bias = 0;
     int gemv = 0;
-    ParseInt(field("gemv_enabled"), gemv);
+    if (!ParseInt(field("has_zero_points"), has_zp) || !ParseInt(field("has_bias"), has_bias) ||
+        !ParseInt(field("gemv_enabled"), gemv) ||
+        (has_zp != 0 && has_zp != 1) || (has_bias != 0 && has_bias != 1) || (gemv != 0 && gemv != 1)) {
+      continue;
+    }
+    key.has_zero_points = has_zp != 0;
+    key.has_bias = has_bias != 0;
     key.gemv_enabled = gemv != 0;
+    key.candidate_fingerprint = field("candidate_fingerprint");
 
     int m_bucket = 0;
-    if (!ParseInt(field("m_bucket"), m_bucket)) {
+    if (!ParseInt(field("m_bucket"), m_bucket) || m_bucket <= 0 || key.n <= 0 || key.k <= 0 ||
+        key.candidate_fingerprint.empty() || key.activation_dtype.empty() || key.weight_type.empty() ||
+        field("result_status") != "selected" || field("kernel_config_version") != kConfigCodecVersion) {
       continue;
     }
 
-    // Locate the start of the config columns by name so appended key columns do not shift them.
-    size_t valid_config_index = header_columns.size();
-    for (size_t i = 0; i < header_columns.size(); ++i) {
-      if (header_columns[i] == "valid_config") {
-        valid_config_index = i;
-        break;
-      }
+    std::vector<std::string> config_columns;
+    for (const auto& name : ConfigColumnNames()) {
+      config_columns.push_back(field(name.c_str()));
     }
-    auto parsed = ParseConfigColumns(values, valid_config_index);
-    if (!parsed.has_value()) {
+    auto parsed = ParseConfigColumns(config_columns, 0);
+    if (!parsed.has_value() || !parsed->has_value() ||
+        field("kernel_family") != ((**parsed).enableCudaKernel ? "cuda_gemv" : "cutlass") ||
+        ((**parsed).enableCudaKernel && !key.gemv_enabled)) {
       continue;
     }
     loaded[key][m_bucket] = *parsed;
@@ -623,17 +737,17 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Load() {
 
   // Reject the file if the format, selection policy, table, or hardware/build signature does not match.
   if (magic_ok_version != kCacheFormatVersion || selection_version != kTacticSelectionVersion ||
-      table_name != kTableMatMulNBits || !signature_.StrictMatches(file_sig)) {
+      table_name != kTableMatMulNBits || !signature_.StrictMatches(file_sig) ||
+      context["kernel_abi_version"] != kKernelAbiVersion ||
+      context["kernel_implementation_version"] != kKernelImplementationVersion ||
+      context["config_codec_version"] != kConfigCodecVersion ||
+      context["timing_mode"] != kTimingMode || context["cache_conditioning_policy"] != kCacheConditioningPolicy ||
+      context["m_bucket_policy"] != kMBucketPolicy || context["runner_family"] != kRunnerFamily) {
+    adopt_snapshot(decltype(table_){});
     return onnxruntime::common::Status::OK();
   }
 
-  std::lock_guard<std::mutex> guard(mutex_);
-  for (auto& [key, buckets] : loaded) {
-    auto& dest = table_[key];
-    for (auto& [m, cfg] : buckets) {
-      dest.emplace(m, cfg);  // Do not clobber entries already set in-process.
-    }
-  }
+  adopt_snapshot(std::move(loaded));
   return onnxruntime::common::Status::OK();
 }
 
@@ -681,14 +795,23 @@ onnxruntime::common::Status MatMulNBitsTacticCache::WriteAllLocked(
     out << "# " << kCacheMagic << '\t' << kCacheFormatVersion << '\n';
     out << "# table\t" << kTableMatMulNBits << '\n';
     out << "# tactic_selection_version\t" << kTacticSelectionVersion << '\n';
+    out << "# kernel_abi_version\t" << kKernelAbiVersion << '\n';
+    out << "# kernel_implementation_version\t" << kKernelImplementationVersion << '\n';
+    out << "# config_codec_version\t" << kConfigCodecVersion << '\n';
+    out << "# timing_mode\t" << kTimingMode << '\n';
+    out << "# cache_conditioning_policy\t" << kCacheConditioningPolicy << '\n';
+    out << "# m_bucket_policy\t" << kMBucketPolicy << '\n';
+    out << "# runner_family\t" << kRunnerFamily << '\n';
     out << "# device_name\t" << TsvEncode(signature_.device_name) << '\n';
     out << "# sm\t" << signature_.sm << '\n';
     out << "# multiprocessor_count\t" << signature_.multiprocessor_count << '\n';
+    out << "# l2_cache_bytes\t" << signature_.l2_cache_bytes << '\n';
     out << "# cuda_runtime\t" << signature_.cuda_runtime << '\n';
     out << "# cuda_driver\t" << signature_.cuda_driver << '\n';
     out << "# ort_version\t" << signature_.ort_version << '\n';
     out << "# ort_git_commit\t" << signature_.ort_git_commit << '\n';
     out << "# ort_build_config\t" << signature_.ort_build_config << '\n';
+    out << "# kernel_build\t" << TsvEncode(signature_.kernel_build) << '\n';
 
     // Column header.
     out << JoinTabs(MatMulNBitsColumnNames()) << '\n';
@@ -698,16 +821,20 @@ onnxruntime::common::Status MatMulNBitsTacticCache::WriteAllLocked(
       for (const auto& [m_bucket, cfg] : buckets) {
         std::vector<std::string> row;
         row.reserve(MatMulNBitsColumnNames().size());
-        row.emplace_back(std::to_string(key.n_16b));
+        row.emplace_back(std::to_string(key.n));
         row.emplace_back(std::to_string(key.k));
         row.emplace_back(TsvEncode(key.activation_dtype));
         row.emplace_back(TsvEncode(key.weight_type));
         row.emplace_back(std::to_string(key.bits));
         row.emplace_back(std::to_string(key.block_size));
         row.emplace_back(key.has_zero_points ? "1" : "0");
-        row.emplace_back(TsvEncode(key.zero_point_dtype));
+        row.emplace_back(key.has_bias ? "1" : "0");
         row.emplace_back(key.gemv_enabled ? "1" : "0");
         row.emplace_back(std::to_string(key.packing_sm));
+        row.emplace_back(key.candidate_fingerprint);
+        row.emplace_back("selected");
+        row.emplace_back(cfg->enableCudaKernel ? "cuda_gemv" : "cutlass");
+        row.emplace_back(kConfigCodecVersion);
         row.emplace_back(std::to_string(m_bucket));
         AppendConfigColumns(row, cfg);
         out << JoinTabs(row) << '\n';
@@ -741,9 +868,10 @@ onnxruntime::common::Status MatMulNBitsTacticCache::WriteAllLocked(
 }
 
 onnxruntime::common::Status MatMulNBitsTacticCache::Flush() {
+  std::lock_guard<std::mutex> io_guard(io_mutex_);
   {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (!dirty_) {
+    if (dirty_rows_.empty()) {
       return onnxruntime::common::Status::OK();
     }
   }
@@ -772,14 +900,14 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Flush() {
     std::lock_guard<std::mutex> disk_guard(disk.mutex_);
     merged = disk.table_;
   }
-  size_t flush_generation = 0;
+  decltype(dirty_rows_) pending;
   {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (!dirty_) {
+    if (dirty_rows_.empty()) {
       return onnxruntime::common::Status::OK();
     }
-    flush_generation = generation_;
-    for (const auto& [key, buckets] : table_) {
+    pending = dirty_rows_;
+    for (const auto& [key, buckets] : pending) {
       auto& dest = merged[key];
       for (const auto& [m, cfg] : buckets) {
         dest[m] = cfg;
@@ -793,15 +921,26 @@ onnxruntime::common::Status MatMulNBitsTacticCache::Flush() {
   {
     std::lock_guard<std::mutex> guard(mutex_);
     known_stamp_ = stamp;
-    // Adopt rows other writers added, since known_stamp_ now hides them from ReloadIfChanged().
-    for (auto& [key, buckets] : merged) {
-      auto& dest = table_[key];
-      for (auto& [m, cfg] : buckets) {
-        dest.emplace(m, cfg);
+    for (const auto& [key, buckets] : pending) {
+      auto dirty = dirty_rows_.find(key);
+      if (dirty == dirty_rows_.end()) {
+        continue;
+      }
+      for (const auto& [m, config] : buckets) {
+        auto current = dirty->second.find(m);
+        if (current != dirty->second.end() && SameTactic(current->second, config)) {
+          dirty->second.erase(current);
+        }
+      }
+      if (dirty->second.empty()) {
+        dirty_rows_.erase(dirty);
       }
     }
-    if (generation_ == flush_generation) {
-      dirty_ = false;
+    table_ = std::move(merged);
+    for (const auto& [key, buckets] : dirty_rows_) {
+      for (const auto& [m, config] : buckets) {
+        table_[key][m] = config;
+      }
     }
   }
   return onnxruntime::common::Status::OK();

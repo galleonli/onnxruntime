@@ -80,7 +80,15 @@ class WeightOnlyGroupwiseQuantGemmPluginProfiler
 
   // Returns the exact initial bucket set used by construction-time profiling.
   static std::vector<int> GetInitialProfileMBuckets(
-      int min_m, int max_m, const std::vector<int>& profile_m_override);
+      int min_m, int max_m, const std::vector<int>& profile_m_override, bool gemv_enabled = true);
+
+  static int GetProfileMForRequest(int m, bool gemv_enabled) {
+    return gemv_enabled && m > 0 && m < 16 ? m : RoundUpProfileM(std::max(1, m), kMaxProfileM);
+  }
+
+  int getProfileMForRequest(int m) const override {
+    return GetProfileMForRequest(m, mGemvEnabled);
+  }
 
   // Overrides the initial profile M-bucket set for this profiler instance (per session). An empty
   // list keeps the built-in default bucket set. Resolved by the kernel from session config / env.
@@ -98,9 +106,10 @@ class WeightOnlyGroupwiseQuantGemmPluginProfiler
     mGroupSize = groupSize;
   }
 
-  void setCudaKernelType(KernelType cudaKernelType, int arch) {
+  void setCudaKernelType(KernelType cudaKernelType, int arch, bool gemv_enabled = false) {
     mCudaKernelType = cudaKernelType;
     mArch = arch;
+    mGemvEnabled = gemv_enabled;
   }
 
   void setL2CacheBytes(size_t l2CacheBytes) {
@@ -110,7 +119,14 @@ class WeightOnlyGroupwiseQuantGemmPluginProfiler
   // Attaches the process-global persistent tactic cache. A nullptr keeps the
   // in-process-only behavior (no disk reads/writes).
   void setPersistentCache(std::shared_ptr<onnxruntime::llm::gemm_cache::MatMulNBitsTacticCache> cache,
-                          onnxruntime::llm::gemm_cache::CacheAccess access = {}) {
+                          onnxruntime::llm::gemm_cache::CacheAccess access = {}, MNKProfileMapPtr session_map = {}) {
+    if (access.RequiresIsolatedProfiles(cache != nullptr)) {
+      if (session_map != nullptr) {
+        setSelectionTactics(session_map);
+      } else {
+        resetSelectionTactics();
+      }
+    }
     mCache = std::move(cache);
     mCacheAccess = access;
   }
@@ -146,6 +162,7 @@ class WeightOnlyGroupwiseQuantGemmPluginProfiler
   int mGroupSize;
   KernelType mCudaKernelType;
   int mArch;
+  bool mGemvEnabled = false;
   size_t mL2CacheBytes = 0;
   std::shared_ptr<onnxruntime::llm::gemm_cache::MatMulNBitsTacticCache> mCache;
   onnxruntime::llm::gemm_cache::CacheAccess mCacheAccess;
